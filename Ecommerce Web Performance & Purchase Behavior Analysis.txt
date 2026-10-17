@@ -1,0 +1,212 @@
+-- 1. Calculate total visit, pageview, transaction for Jan, Feb and March 2017 (order by month)
+SELECT
+  format_date("%Y%m", parse_date("%Y%m%d", date)) as month
+  , SUM(totals.visits) AS total_visits
+  , SUM(totals.pageviews) AS total_pageviews
+  , SUM(totals.transactions) AS total_transactions
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`
+WHERE _TABLE_SUFFIX BETWEEN '0101' AND '0331'
+GROUP BY month
+ORDER BY month
+
+-- 2. Bounce rate per traffic source in July 2017 (Bounce_rate = num_bounce/total_visit)
+SELECT
+  trafficsource.source
+  , SUM(totals.visits) as total_visits
+  , SUM(totals.bounces) as total_bounces
+  , ROUND(100.0 * 
+    SUM(totals.bounces) / sum(totals.visits), 3) as bounce_rate
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_201707*`
+GROUP BY trafficsource.source
+ORDER BY total_visits desc
+
+-- 3. Revenue by traffic source by week, by month in June 2017
+with month_data as(
+  select
+    "Month" as time_type,
+    format_date("%Y%m", parse_date("%Y%m%d", date)) as month,
+    trafficSource.source AS source,
+    sum(p.productRevenue)/1000000 AS revenue
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_201706*`,
+    unnest(hits) hits,
+    unnest(product) p
+  where p.productRevenue is not null
+  group by time_type, month, source
+  order by revenue DESC
+),
+week_data as(
+  SELECT
+    "Week" as time_type,
+    format_date("%Y%W", parse_date("%Y%m%d", date)) as week,
+    trafficSource.source AS source,
+    SUM(p.productRevenue)/1000000 AS revenue
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_201706*`,
+    unnest(hits) hits,
+    unnest(product) p
+  WHERE p.productRevenue is not null
+  GROUP BY time_type, week, source
+  order by revenue DESC
+)
+
+select * from month_data
+union all
+select * from week_data
+order by time_type, revenue desc
+
+
+-- 4. Conversion rate by traffic source in 2017. (order by conversion_rate desc)
+select
+  trafficsource.source
+  , sum(totals.visits) as total_visits
+  , sum(totals.transactions) as total_transactions
+  , round(100.0 * sum(totals.transactions) / sum(totals.visits), 2) || '%' as conversion_rate
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`
+group by trafficsource.source
+having sum(totals.transactions) >= 50
+order by conversion_rate desc
+
+-- 5. Average number of pageviews by purchaser type (purchasers vs non-purchasers) in June, July 2017.
+with purchaser_data as(
+  select
+      format_date("%Y%m",parse_date("%Y%m%d",date)) as month,
+      (sum(totals.pageviews)/count(distinct fullvisitorid)) as avg_pageviews_purchase,
+  from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`
+    , unnest(hits) hits
+    , unnest(product) product
+  where _table_suffix between '0601' and '0731'
+  and totals.transactions>=1
+  and product.productRevenue is not null
+  group by month
+),
+non_purchaser_data as(
+  select
+      format_date("%Y%m",parse_date("%Y%m%d",date)) as month,
+      sum(totals.pageviews)/count(distinct fullvisitorid) as avg_pageviews_non_purchase,
+  from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`
+    , unnest(hits) hits
+    , unnest(product) product
+  where _table_suffix between '0601' and '0731'
+  and totals.transactions is null
+  and product.productRevenue is null
+  group by month
+)
+
+select
+    pd.*,
+    avg_pageviews_non_purchase
+from purchaser_data pd
+full join non_purchaser_data using(month)
+order by pd.month
+
+-- 6. Average number of transactions per user that made a purchase in July 2017
+select
+  format_date('%Y%m', parse_date('%Y%m%d', date)) as mth
+  , sum(totals.transactions) / count(distinct fullVisitorId) as avg_total_transactions_per_user
+from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`,
+unnest(hits) as hits,
+unnest(product) as product
+where
+  _table_suffix between '0701' and '0731'
+  and totals.transactions >= 1
+  and productrevenue is not null
+group by format_date('%Y%m', parse_date('%Y%m%d', date))
+
+-- 7. Revenue contribution by device (desktop,mobile...) (order by ratio desc)
+select
+  device.deviceCategory
+  ,round(sum(productRevenue)/1e6, 2) as revenue_by_device
+  ,round(sum(sum(productRevenue)/1e6) over (), 2) as total_revenue
+  ,round(100.0 * sum(productRevenue) / sum(sum(productRevenue)) over (), 2) as ratio
+from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`,
+unnest (hits) as hits,
+unnest (product) as product
+where
+  totals.transactions is not null
+  and productRevenue is not null
+group by device.deviceCategory
+order by ratio desc
+
+-- 8.  Other products purchased by customers who purchased product "YouTube Men's Vintage Henley" in July 2017. 
+-- Output should show product name and the quantity was ordered.
+with customer_list as (
+  select
+    distinct fullVisitorId
+  from `bigquery-public-data.google_analytics_sample.ga_sessions_201707*`,
+  unnest(hits) as hits,
+  unnest(product) as product
+  where
+    v2ProductName = "YouTube Men's Vintage Henley"
+    and productrevenue is not null
+)
+
+select
+  v2ProductName
+  ,sum(productQuantity) as quantity
+from `bigquery-public-data.google_analytics_sample.ga_sessions_201707*`,
+unnest(hits) as hits,
+unnest(product) as product
+where
+  fullVisitorId in (select * from customer_list)
+  and v2ProductName <> "YouTube Men's Vintage Henley"
+  and productRevenue is not null
+  and totals.transactions >= 1
+group by v2ProductName
+order by quantity desc, v2ProductName
+
+-- 9. Calculate cohort map from productview to addtocart to purchase in Jan, Feb and March 2017. 
+-- For example, 100% product view then 40% add_to_cart and 10% purchase.
+-- Add_to_cart_rate = number product  addtocart/number product view. 
+-- Purchase_rate = number product purchase/number product view. 
+-- The output should be calculated in product level.
+select
+  format_date('%Y%m', parse_date('%Y%m%d', date)) as mth
+  ,sum(case
+    when eCommerceAction.action_type = '2' then 1 else 0 end) as num_product_view
+  ,sum(case
+    when eCommerceAction.action_type = '3' then 1 else 0 end) as num_addtocart
+  ,sum(case
+    when eCommerceAction.action_type = '6' then 1 else 0 end) as num_purchase
+  ,round(100.0 * safe_divide(
+    sum(case when eCommerceAction.action_type = '3' then 1 else 0 end)
+    ,sum(case when eCommerceAction.action_type = '2' then 1 else 0 end)
+  ), 2) as addtocart_rate
+  ,round(100.0 * safe_divide(
+    sum(case when eCommerceAction.action_type = '6' then 1 else 0 end)
+    ,sum(case when eCommerceAction.action_type = '2' then 1 else 0 end)
+  ), 2) as purchase_rate
+from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`,
+unnest(hits) as hits,
+unnest(product) as product
+where
+  _table_suffix between '0101' and '0331'
+group by format_date('%Y%m', parse_date('%Y%m%d', date))
+order by mth
+
+-- 10. Calculate revenue by week from May to July 2017 and culmulative revenue.
+with weekly as (
+  select
+    format_date('%Y-%U', parse_date('%Y%m%d', date)) as week
+    ,round(sum(productRevenue)/1e6, 2) as weekly_revenue
+  from `bigquery-public-data.google_analytics_sample.ga_sessions_2017*`,
+  unnest(hits) as hits,
+  unnest(product) as product
+  where
+    _table_suffix between '0501' and '0731'
+    and productRevenue is not null
+  group by format_date('%Y-%U', parse_date('%Y%m%d', date))
+  order by week
+)
+
+select
+  *,
+  sum(weekly_revenue) over (
+    order by week
+    rows between unbounded preceding and current row
+  ) as cumulative_revenue
+from weekly
+order by week
+
+
+
+
+
